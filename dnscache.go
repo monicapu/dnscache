@@ -2,12 +2,19 @@ package dnscache
 
 import (
 	"context"
+	"log"
 	"net"
 	"net/http/httptrace"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
+)
+
+var (
+	defaultFreq          = 3 * time.Second
+	defaultLookupTimeout = 10 * time.Second
+	DefaultCacheTimeout  = 10 * time.Minute
 )
 
 type DNSResolver interface {
@@ -30,17 +37,96 @@ type Resolver struct {
 	// OnCacheMiss is executed if the host or address is not included in
 	// the cache and the default lookup is executed.
 	OnCacheMiss func()
+
+	// cache timeout, when cache will expire, then refresh the key
+	CacheTimeout time.Duration
+	// 缓存到期时间需要大于2倍刷新时间
+	// 自动刷新时间间隔
+	RefreshTime time.Duration
+
+	closer func()
 }
 
 type ResolverRefreshOptions struct {
 	ClearUnused      bool
 	PersistOnFailure bool
+	// ClearUnused 方案是，在上一个刷新时间周期里若缓存没有被访问则删除
+	// ClearUnused 方案，在每次访问缓存时需要加读锁和写锁，性能不太好
+	// 如果采用 CacheExpireUnused 缓存过期方案，ClearUnused 策略便不使用了
+	CacheExpireUnused bool
 }
 
 type cacheEntry struct {
-	rrs  []string
-	err  error
-	used bool
+	rrs    []string
+	err    error
+	used   bool
+	expire int64 //刷新的时候赋值，当前时间+过期时间
+}
+
+// New initializes DNS cache resolver and starts auto refreshing in a new goroutine.
+// To stop refreshing, call `Stop()` function.
+func New(freq time.Duration, lookupTimeout time.Duration, cacheTimeout time.Duration, options *ResolverRefreshOptions) (*Resolver, error) {
+	if freq <= 0 {
+		freq = defaultFreq
+	}
+
+	if lookupTimeout <= 0 {
+		lookupTimeout = defaultLookupTimeout
+	}
+
+	if cacheTimeout <= 0 {
+		cacheTimeout = DefaultCacheTimeout
+	}
+	if options == nil {
+		options = &ResolverRefreshOptions{
+			ClearUnused:       false,
+			PersistOnFailure:  false,
+			CacheExpireUnused: true,
+		}
+	}
+
+	ticker := time.NewTicker(freq)
+	ch := make(chan struct{})
+	closer := func() {
+		ticker.Stop()
+		close(ch)
+	}
+
+	// copy handler function to avoid race
+	//onRefreshedFn := onRefreshed
+	//lookupIPFn := lookupIP
+
+	r := &Resolver{
+		Timeout:      lookupTimeout,
+		CacheTimeout: cacheTimeout,
+		RefreshTime:  freq,
+		closer:       closer,
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				//log.Print("dnscache refresh ticker")
+				r.RefreshWithOptions(*options)
+				//onRefreshedFn()
+			case <-ch:
+				return
+			}
+		}
+	}()
+
+	return r, nil
+}
+
+// Stop stops auto refreshing.
+func (r *Resolver) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closer != nil {
+		r.closer()
+		r.closer = nil
+	}
 }
 
 // LookupAddr performs a reverse lookup for the given address, returning a list
@@ -61,8 +147,12 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 // the last Refresh. If clearUnused is true, entries which haven't be used since the
 // last Refresh are removed from the cache. If persistOnFailure is true, stale
 // entries will not be removed on failed lookups
-func (r *Resolver) refreshRecords(clearUnused bool, persistOnFailure bool) {
+func (r *Resolver) refreshRecords(clearUnused bool, persistOnFailure bool, cacheExpireUnused bool) {
 	r.once.Do(r.init)
+	if cacheExpireUnused {
+		r.refreshRecordsByCacheTimeout(persistOnFailure, cacheExpireUnused)
+		return
+	}
 	r.mu.RLock()
 	update := make([]string, 0, len(r.cache))
 	del := make([]string, 0, len(r.cache))
@@ -84,16 +174,44 @@ func (r *Resolver) refreshRecords(clearUnused bool, persistOnFailure bool) {
 	}
 
 	for _, key := range update {
-		r.update(context.Background(), key, false, persistOnFailure)
+		rrs, err := r.update(context.Background(), key, false, persistOnFailure)
+		if err != nil {
+			log.Printf("update dnscache has some error, key: %v, rrs: %v, err:%v", key, rrs, err)
+		}
+	}
+}
+
+func (r *Resolver) refreshRecordsByCacheTimeout(persistOnFailure bool, cacheExpireUnused bool) {
+	r.mu.RLock()
+	update := make([]string, 0, len(r.cache))
+	for key, entry := range r.cache {
+		// 距离缓存到期多久前，需要触发刷新动作：缓存到期时间需要大于2倍刷新时间
+		if (entry.expire - time.Now().Unix()) <= r.RefreshTime.Milliseconds()/1000*2 {
+			update = append(update, key)
+			//log.Printf("refreshRecordsByCacheTimeout, key: %v, entry: %v, timeDiff:%v, refreshTime:%v", key, entry, entry.expire-time.Now().Unix(), r.RefreshTime.Milliseconds()/1000*2)
+		}
+	}
+	r.mu.RUnlock()
+
+	// 如果使用了 cacheExpireUnused 策略，则不使用了 clearUnused 策略
+	isUsed := false
+	if cacheExpireUnused {
+		isUsed = true
+	}
+	for _, key := range update {
+		rrs, err := r.update(context.Background(), key, isUsed, persistOnFailure)
+		if err != nil {
+			log.Printf("update dnscache has some error, key: %v, rrs: %v, err:%v", key, rrs, err)
+		}
 	}
 }
 
 func (r *Resolver) Refresh(clearUnused bool) {
-	r.refreshRecords(clearUnused, false)
+	r.refreshRecords(clearUnused, false, false)
 }
 
 func (r *Resolver) RefreshWithOptions(options ResolverRefreshOptions) {
-	r.refreshRecords(options.ClearUnused, options.PersistOnFailure)
+	r.refreshRecords(options.ClearUnused, options.PersistOnFailure, options.CacheExpireUnused)
 }
 
 func (r *Resolver) init() {
@@ -113,6 +231,10 @@ func (r *Resolver) lookup(ctx context.Context, key string) (rrs []string, err er
 		}
 		rrs, err = r.update(ctx, key, true, false)
 	}
+	//else {
+	//	log.Printf("lookup hit cache, key: %v, map: %v", key, r.cache)
+	//}
+
 	return
 }
 
@@ -150,6 +272,7 @@ func (r *Resolver) update(ctx context.Context, key string, used bool, persistOnF
 			}
 		}
 
+		log.Printf("find from dns server, key: %v, rrs: %v", key, rrs)
 		r.mu.Lock()
 		r.storeLocked(key, rrs, used, err)
 		r.mu.Unlock()
@@ -237,13 +360,22 @@ func (r *Resolver) storeLocked(key string, rrs []string, used bool, err error) {
 		entry.rrs = rrs
 		entry.err = err
 		entry.used = used
+		entry.expire = time.Now().Unix() + r.getCacheTimeOut().Milliseconds()/1000
 		return
 	}
 	r.cache[key] = &cacheEntry{
-		rrs:  rrs,
-		err:  err,
-		used: used,
+		rrs:    rrs,
+		err:    err,
+		used:   used,
+		expire: time.Now().Unix() + r.getCacheTimeOut().Milliseconds()/1000,
 	}
+}
+
+func (r *Resolver) getCacheTimeOut() time.Duration {
+	if r.CacheTimeout == 0 {
+		return DefaultCacheTimeout
+	}
+	return r.CacheTimeout
 }
 
 var defaultResolver = &defaultResolverWithTrace{}
@@ -255,8 +387,8 @@ type defaultResolverWithTrace struct{}
 func (d *defaultResolverWithTrace) LookupHost(ctx context.Context, host string) (addrs []string, err error) {
 	// `net.Resolver#LookupHost` does not cause invocation of `net.Resolver#lookupIPAddr`, therefore the `DNSStart` and `DNSDone` tracing hooks
 	// built into the stdlib are never called. `LookupIP`, despite it's name, can also be used to lookup a hostname but does cause these hooks to be
-	// triggered. The format of the reponse is different, therefore it needs this thin wrapper converting it.
-	rawIPs, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	// triggered. The format of the response is different, therefore it needs this thin wrapper converting it.
+	rawIPs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, err
 	}
